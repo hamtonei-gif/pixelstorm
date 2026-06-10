@@ -23,11 +23,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install opencv-python
-          pip install mediapipe
+          pip install mediapipe==0.10.9
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --noconsole --name PixelStorm --add-data "puzzle.jpg;." --hidden-import mediapipe --hidden-import cv2 --collect-all mediapipe main.py
+          pyinstaller --onefile --noconsole --name PixelStorm `
+            --add-data "puzzle.jpg;." `
+            --hidden-import mediapipe `
+            --hidden-import mediapipe.python `
+            --hidden-import mediapipe.python.solutions `
+            --hidden-import mediapipe.python.solutions.hands `
+            --hidden-import mediapipe.python.solutions.drawing_utils `
+            --collect-all mediapipe `
+            --collect-all cv2 `
+            main.py
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4
