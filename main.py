@@ -14,12 +14,14 @@ from datetime import datetime
 
 # ---------------- SETTINGS ----------------
 GRID_SIZE = 3
-PIECE_SIZE = 150
-SNAP_DISTANCE = 60
-PINCH_THRESHOLD = 45
-SMOOTHING = 0.5
 WIN_DELAY = 5
 PINCH_DEBOUNCE_FRAMES = 3
+SMOOTHING = 0.5
+
+# Dynamic values (calculated at runtime based on resolution)
+# PIECE_SIZE     → 20% of frame height
+# SNAP_DISTANCE  → 40% of PIECE_SIZE
+# PINCH_THRESHOLD → 6% of frame height
 
 employee_name = ""
 employee_id = ""
@@ -48,51 +50,103 @@ def save_results(name, emp_id, completion_time):
     except Exception as e:
         print(f"Could not save results: {e}")
 
-# ---------------- AUTO CAMERA DETECTION ----------------
-def get_best_camera():
-    available = []
-    for index in range(5):
+# ---------------- SMART CAMERA DETECTION ----------------
+def score_camera(index):
+    """
+    Returns a quality score for a camera at given index.
+    Higher = better. Returns -1 if camera is unusable.
+    Picks based on resolution + brightness to avoid
+    ultrawide / macro lenses on multi-camera setups.
+    """
+    for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]:
         try:
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                continue
+
+            h, w = frame.shape[:2]
+            resolution_score = w * h
+
+            # Brightness score — too dark = likely a bad lens (macro/IR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness = gray.mean()
+            if brightness < 20:  # Extremely dark = skip
+                return -1
+
+            return resolution_score + int(brightness * 100)
+
+        except Exception:
+            pass
+
+    return -1
+
+def get_best_camera():
+    """
+    Scans indices 0-6, scores each camera, returns the best one.
+    Among equal-quality cameras, prefers higher index (external over built-in).
+    """
+    scores = {}
+    for index in range(7):
+        score = score_camera(index)
+        if score > 0:
+            scores[index] = score
+            print(f"Camera {index}: score={score}")
+
+    if not scores:
+        return 0
+
+    if len(scores) == 1:
+        return list(scores.keys())[0]
+
+    # Separate built-in (index 0) from externals
+    externals = {i: s for i, s in scores.items() if i > 0}
+
+    if externals:
+        # Among externals, pick highest score; tie-break by highest index
+        best = max(externals, key=lambda i: (externals[i], i))
+        print(f"Using external camera at index {best}")
+        return best
+
+    return 0
+
+def open_camera(index):
+    """Try opening a camera with multiple backends."""
+    for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]:
+        try:
+            cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
             if cap.isOpened():
-                ret, _ = cap.read()
+                ret, frame = cap.read()
                 if ret:
-                    available.append(index)
+                    return cap
             cap.release()
         except Exception:
             pass
-    if not available:
-        return 0
-    if len(available) > 1:
-        return available[-1]
-    return available[0]
+    return None
 
 # ---------------- GAME FUNCTION ----------------
 def run_game():
     try:
         # --- Camera ---
         camera_index = get_best_camera()
-        cap = None
-        for idx in [camera_index, 0]:
-            for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]:
-                try:
-                    if backend is None:
-                        cap = cv2.VideoCapture(idx)
-                    else:
-                        cap = cv2.VideoCapture(idx, backend)
-                    if cap.isOpened():
-                        ret, _ = cap.read()
-                        if ret:
-                            break
-                    cap.release()
-                    cap = None
-                except:
-                    cap = None
-            if cap is not None:
-                break
+        cap = open_camera(camera_index)
 
-        if cap is None or not cap.isOpened():
-            root.after(0, lambda: messagebox.showerror("Camera Error", "Could not open any camera.\nPlease check your camera is connected and not in use by another app."))
+        # Fallback to index 0 if best camera failed
+        if cap is None and camera_index != 0:
+            print("Best camera failed, falling back to index 0")
+            cap = open_camera(0)
+
+        if cap is None:
+            root.after(0, lambda: messagebox.showerror(
+                "Camera Error",
+                "Could not open any camera.\nPlease check your camera is connected and not used by another app."
+            ))
             root.after(0, root.deiconify)
             return
 
@@ -104,19 +158,45 @@ def run_game():
             return
 
         h, w, _ = frame.shape
+        print(f"Camera resolution: {w}x{h}")
+
+        # --- FIX: Dynamic sizing based on resolution ---
+        # PIECE_SIZE = 20% of frame height, capped between 100 and 220
+        PIECE_SIZE = max(100, min(220, int(h * 0.20)))
+        SNAP_DISTANCE = int(PIECE_SIZE * 0.4)
+        # PINCH_THRESHOLD = 6% of frame height (scales with how far camera is)
+        PINCH_THRESHOLD = max(25, int(h * 0.06))
+
+        print(f"PIECE_SIZE={PIECE_SIZE}, SNAP_DISTANCE={SNAP_DISTANCE}, PINCH_THRESHOLD={PINCH_THRESHOLD}")
+
+        # --- FIX: Grid must fit within frame with padding ---
+        grid_total = GRID_SIZE * PIECE_SIZE
+        # If grid is too big for the frame, shrink PIECE_SIZE to fit
+        max_grid = int(min(w, h) * 0.75)
+        if grid_total > max_grid:
+            PIECE_SIZE = max_grid // GRID_SIZE
+            SNAP_DISTANCE = int(PIECE_SIZE * 0.4)
+            grid_total = GRID_SIZE * PIECE_SIZE
+            print(f"Grid too big, shrunk PIECE_SIZE to {PIECE_SIZE}")
+
+        grid_start_x = (w - grid_total) // 2
+        grid_start_y = (h - grid_total) // 2
 
         # --- Puzzle image ---
         image_path = get_image_path()
         if not os.path.exists(image_path):
             cap.release()
-            root.after(0, lambda: messagebox.showerror("File Error", f"puzzle.jpg not found!\nLooking in: {get_base_path()}\n\nMake sure puzzle.jpg is in the same folder as the .exe"))
+            root.after(0, lambda: messagebox.showerror(
+                "File Error",
+                f"puzzle.jpg not found!\nLooking in: {get_base_path()}\n\nMake sure puzzle.jpg is in the same folder as the .exe"
+            ))
             root.after(0, root.deiconify)
             return
 
         full_image = cv2.imread(image_path)
         if full_image is None:
             cap.release()
-            root.after(0, lambda: messagebox.showerror("File Error", "puzzle.jpg found but could not be read.\nMake sure it is a valid JPG image."))
+            root.after(0, lambda: messagebox.showerror("File Error", "puzzle.jpg could not be read. Make sure it is a valid JPG image."))
             root.after(0, root.deiconify)
             return
 
@@ -125,14 +205,11 @@ def run_game():
         hands = mp_hands_module.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
+            min_detection_confidence=0.6,   # Slightly lower for far/wide cameras
+            min_tracking_confidence=0.6
         )
 
         # --- Setup pieces ---
-        grid_start_x = (w - GRID_SIZE * PIECE_SIZE) // 2
-        grid_start_y = (h - GRID_SIZE * PIECE_SIZE) // 2
-
         full_image = cv2.resize(full_image, (GRID_SIZE * PIECE_SIZE, GRID_SIZE * PIECE_SIZE))
         image_pieces = []
         for row in range(GRID_SIZE):
@@ -155,6 +232,11 @@ def run_game():
         pinch_counter = 0
         release_counter = 0
         confirmed_pinching = False
+
+        # Current camera index (can be switched with C key)
+        current_camera_index = camera_index
+        available_cameras = [i for i in range(7) if score_camera(i) > 0]
+        print(f"All available cameras: {available_cameras}")
 
         random_positions = []
         for _ in range(GRID_SIZE * GRID_SIZE):
@@ -180,6 +262,9 @@ def run_game():
         cv2.namedWindow("PixelStorm", cv2.WINDOW_NORMAL)
         cv2.setWindowProperty("PixelStorm", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+        show_hint = True
+        hint_start = time.time()
+
         # --- Game loop ---
         while True:
             try:
@@ -192,7 +277,7 @@ def run_game():
                 try:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     results = hands.process(rgb)
-                except Exception as e:
+                except Exception:
                     results = None
 
                 cursor_x, cursor_y = None, None
@@ -218,6 +303,7 @@ def run_game():
                         if math.hypot(smooth_thumb_x - cursor_x, smooth_thumb_y - cursor_y) < PINCH_THRESHOLD:
                             raw_pinching = True
 
+                # Debounce pinch
                 if raw_pinching:
                     pinch_counter += 1
                     release_counter = 0
@@ -257,16 +343,18 @@ def run_game():
 
                 was_pinching = confirmed_pinching
 
+                # Draw grid
                 for i in range(GRID_SIZE + 1):
                     cv2.line(frame,
                              (grid_start_x + i * PIECE_SIZE, grid_start_y),
-                             (grid_start_x + i * PIECE_SIZE, grid_start_y + GRID_SIZE * PIECE_SIZE),
+                             (grid_start_x + i * PIECE_SIZE, grid_start_y + grid_total),
                              (0, 0, 0), 2)
                     cv2.line(frame,
                              (grid_start_x, grid_start_y + i * PIECE_SIZE),
-                             (grid_start_x + GRID_SIZE * PIECE_SIZE, grid_start_y + i * PIECE_SIZE),
+                             (grid_start_x + grid_total, grid_start_y + i * PIECE_SIZE),
                              (0, 0, 0), 2)
 
+                # Draw pieces
                 for piece in pieces:
                     x = max(0, min(w - PIECE_SIZE, piece["x"]))
                     y = max(0, min(h - PIECE_SIZE, piece["y"]))
@@ -275,11 +363,25 @@ def run_game():
                     except Exception:
                         pass
 
+                # FIX: Draw visual cursor so player can see exactly where finger is
+                if cursor_x and cursor_y:
+                    color = (0, 255, 0) if confirmed_pinching else (255, 255, 255)
+                    cv2.circle(frame, (cursor_x, cursor_y), 12, color, -1)
+                    cv2.circle(frame, (cursor_x, cursor_y), 14, (0, 0, 0), 2)
+
+                # Timer
                 if not game_complete:
                     elapsed = int(time.time() - start_time)
                     cv2.putText(frame, f"Time: {elapsed}s", (40, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
 
+                # Hint: press C to switch camera (show for first 5 seconds)
+                if show_hint and time.time() - hint_start < 5:
+                    cv2.putText(frame, "Press C to switch camera",
+                                (40, h - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+
+                # Win condition
                 if placed_count == GRID_SIZE * GRID_SIZE and not game_complete:
                     game_complete = True
                     completion_time = time.time() - start_time
@@ -301,8 +403,25 @@ def run_game():
                         break
 
                 cv2.imshow("PixelStorm", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
+
+                key = cv2.waitKey(1) & 0xFF
+
+                # ESC to quit
+                if key == 27:
                     break
+
+                # C key to cycle through cameras
+                if key == ord('c') or key == ord('C'):
+                    if len(available_cameras) > 1:
+                        current_idx_in_list = available_cameras.index(current_camera_index) if current_camera_index in available_cameras else 0
+                        next_idx = (current_idx_in_list + 1) % len(available_cameras)
+                        new_camera_index = available_cameras[next_idx]
+                        new_cap = open_camera(new_camera_index)
+                        if new_cap:
+                            cap.release()
+                            cap = new_cap
+                            current_camera_index = new_camera_index
+                            print(f"Switched to camera {new_camera_index}")
 
             except Exception as e:
                 print(f"Frame error: {e}")
