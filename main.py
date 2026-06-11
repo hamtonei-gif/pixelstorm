@@ -147,14 +147,14 @@ def run_game():
                 "Camera Error",
                 "Could not open any camera.\nPlease check your camera is connected and not used by another app."
             ))
-            root.after(0, root.deiconify)
+            root.after(500, root.deiconify)
             return
 
         ret, frame = cap.read()
         if not ret:
             cap.release()
             root.after(0, lambda: messagebox.showerror("Camera Error", "Camera opened but could not read a frame."))
-            root.after(0, root.deiconify)
+            root.after(500, root.deiconify)
             return
 
         h, w, _ = frame.shape
@@ -190,14 +190,14 @@ def run_game():
                 "File Error",
                 f"puzzle.jpg not found!\nLooking in: {get_base_path()}\n\nMake sure puzzle.jpg is in the same folder as the .exe"
             ))
-            root.after(0, root.deiconify)
+            root.after(500, root.deiconify)
             return
 
         full_image = cv2.imread(image_path)
         if full_image is None:
             cap.release()
             root.after(0, lambda: messagebox.showerror("File Error", "puzzle.jpg could not be read. Make sure it is a valid JPG image."))
-            root.after(0, root.deiconify)
+            root.after(500, root.deiconify)
             return
 
         # --- MediaPipe ---
@@ -444,11 +444,14 @@ def run_game():
             cv2.destroyAllWindows()
         except:
             pass
-        root.after(0, root.deiconify)
+        root.after(500, root.deiconify)
 
 
 def start_game():
-    root.after(0, root.withdraw)
+    root.withdraw()
+    root.after(300, _launch_game_thread)
+
+def _launch_game_thread():
     t = threading.Thread(target=run_game, daemon=True)
     t.start()
 
