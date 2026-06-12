@@ -25,9 +25,9 @@ jobs:
           pip install opencv-python
           pip install mediapipe==0.10.9
 
-      - name: Build EXE
+      - name: Build game EXE (_game.exe)
         run: |
-          pyinstaller --onefile --noconsole --name PixelStorm `
+          pyinstaller --onefile --noconsole --name _game `
             --add-data "puzzle.jpg;." `
             --hidden-import mediapipe `
             --hidden-import mediapipe.python `
@@ -36,10 +36,21 @@ jobs:
             --hidden-import mediapipe.python.solutions.drawing_utils `
             --collect-all mediapipe `
             --collect-all cv2 `
+            _game.py
+
+      - name: Build launcher EXE (PixelStorm.exe)
+        run: |
+          pyinstaller --onefile --noconsole --name PixelStorm `
             main.py
 
-      - name: Upload EXE as artifact
+      - name: Collect both EXEs
+        run: |
+          mkdir output
+          copy dist\PixelStorm.exe output\
+          copy dist\_game.exe output\
+
+      - name: Upload as artifact
         uses: actions/upload-artifact@v4
         with:
           name: PixelStorm-Windows
-          path: dist/PixelStorm.exe
+          path: output\
