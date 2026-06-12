@@ -1,5 +1,3 @@
-import tkinter as tk
-from tkinter import messagebox
 import cv2
 import mediapipe as mp
 import math
@@ -8,7 +6,6 @@ import time
 import os
 import sys
 import csv
-import threading
 import traceback
 from datetime import datetime
 
@@ -18,20 +15,14 @@ WIN_DELAY = 5
 PINCH_DEBOUNCE_FRAMES = 3
 SMOOTHING = 0.5
 
-# Dynamic values (calculated at runtime based on resolution)
-# PIECE_SIZE     → 20% of frame height
-# SNAP_DISTANCE  → 40% of PIECE_SIZE
-# PINCH_THRESHOLD → 6% of frame height
-
 employee_name = ""
 employee_id = ""
 
-# ---------------- IMAGE PATH (EXE SAFE) ----------------
+# ---------------- PATH HELPER ----------------
 def get_base_path():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.abspath(__file__))
 
 def get_image_path():
     return os.path.join(get_base_path(), "puzzle.jpg")
@@ -50,79 +41,47 @@ def save_results(name, emp_id, completion_time):
     except Exception as e:
         print(f"Could not save results: {e}")
 
-# ---------------- SMART CAMERA DETECTION ----------------
+# ---------------- CAMERA HELPERS ----------------
 def score_camera(index):
-    """
-    Returns a quality score for a camera at given index.
-    Higher = better. Returns -1 if camera is unusable.
-    Picks based on resolution + brightness to avoid
-    ultrawide / macro lenses on multi-camera setups.
-    """
     for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]:
         try:
             cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
             if not cap.isOpened():
                 cap.release()
                 continue
-
             ret, frame = cap.read()
             cap.release()
-
             if not ret or frame is None:
                 continue
-
             h, w = frame.shape[:2]
-            resolution_score = w * h
-
-            # Brightness score — too dark = likely a bad lens (macro/IR)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             brightness = gray.mean()
-            if brightness < 20:  # Extremely dark = skip
+            if brightness < 20:
                 return -1
-
-            return resolution_score + int(brightness * 100)
-
+            return w * h + int(brightness * 100)
         except Exception:
             pass
-
     return -1
 
 def get_best_camera():
-    """
-    Scans indices 0-6, scores each camera, returns the best one.
-    Among equal-quality cameras, prefers higher index (external over built-in).
-    """
     scores = {}
     for index in range(7):
-        score = score_camera(index)
-        if score > 0:
-            scores[index] = score
-            print(f"Camera {index}: score={score}")
-
+        s = score_camera(index)
+        if s > 0:
+            scores[index] = s
     if not scores:
         return 0
-
-    if len(scores) == 1:
-        return list(scores.keys())[0]
-
-    # Separate built-in (index 0) from externals
     externals = {i: s for i, s in scores.items() if i > 0}
-
     if externals:
-        # Among externals, pick highest score; tie-break by highest index
-        best = max(externals, key=lambda i: (externals[i], i))
-        print(f"Using external camera at index {best}")
-        return best
-
+        return max(externals, key=lambda i: (externals[i], i))
     return 0
 
 def open_camera(index):
-    """Try opening a camera with multiple backends."""
     for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]:
         try:
             cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
             if cap.isOpened():
-                ret, frame = cap.read()
+                ret, _ = cap.read()
                 if ret:
                     return cap
             cap.release()
@@ -130,94 +89,247 @@ def open_camera(index):
             pass
     return None
 
-# ---------------- GAME FUNCTION ----------------
-def run_game():
-    try:
-        # --- Camera ---
-        camera_index = get_best_camera()
-        cap = open_camera(camera_index)
+# ---------------- DRAW TEXT HELPERS ----------------
+def draw_centered_text(frame, text, y, scale, color, thickness=2):
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    size = cv2.getTextSize(text, font, scale, thickness)[0]
+    x = (w - size[0]) // 2
+    cv2.putText(frame, text, (x, y), font, scale, (0,0,0), thickness+3)
+    cv2.putText(frame, text, (x, y), font, scale, color, thickness)
 
-        # Fallback to index 0 if best camera failed
-        if cap is None and camera_index != 0:
-            print("Best camera failed, falling back to index 0")
-            cap = open_camera(0)
+def draw_input_box(frame, label, value, y, active, w):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    box_w, box_h = 500, 50
+    box_x = (w - box_w) // 2
+    # Label
+    cv2.putText(frame, label, (box_x, y - 10), font, 0.7, (200, 200, 200), 1)
+    # Box background
+    box_color = (255, 255, 255) if active else (180, 180, 180)
+    cv2.rectangle(frame, (box_x, y), (box_x + box_w, y + box_h), box_color, -1)
+    cv2.rectangle(frame, (box_x, y), (box_x + box_w, y + box_h), (0, 200, 150) if active else (100,100,100), 2)
+    # Value text
+    display = value + ("|" if active and int(time.time() * 2) % 2 == 0 else "")
+    cv2.putText(frame, display, (box_x + 10, y + 35), font, 0.8, (0, 0, 0), 2)
 
-        if cap is None:
-            root.after(0, lambda: messagebox.showerror(
-                "Camera Error",
-                "Could not open any camera.\nPlease check your camera is connected and not used by another app."
-            ))
-            root.after(500, root.deiconify)
-            return
+def draw_button(frame, text, y, w):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    btn_w, btn_h = 300, 60
+    btn_x = (w - btn_w) // 2
+    cv2.rectangle(frame, (btn_x, y), (btn_x + btn_w, y + btn_h), (0, 170, 120), -1)
+    cv2.rectangle(frame, (btn_x, y), (btn_x + btn_w, y + btn_h), (0, 255, 180), 2)
+    size = cv2.getTextSize(text, font, 0.9, 2)[0]
+    tx = btn_x + (btn_w - size[0]) // 2
+    ty = y + (btn_h + size[1]) // 2
+    cv2.putText(frame, text, (tx, ty), font, 0.9, (255, 255, 255), 2)
+    return (btn_x, y, btn_x + btn_w, y + btn_h)
 
+# ---------------- EMPLOYEE FORM (inside OpenCV) ----------------
+def run_employee_form(cap, w, h):
+    """
+    Shows name/ID input form inside the OpenCV window.
+    Returns (name, employee_id) or (None, None) if user closes.
+    """
+    name_val = ""
+    id_val = ""
+    active_field = 0  # 0 = name, 1 = id
+
+    name_y = h // 2 - 120
+    id_y = h // 2 + 20
+    btn_y = h // 2 + 160
+
+    while True:
         ret, frame = cap.read()
         if not ret:
-            cap.release()
-            root.after(0, lambda: messagebox.showerror("Camera Error", "Camera opened but could not read a frame."))
-            root.after(500, root.deiconify)
-            return
+            frame = None
 
-        h, w, _ = frame.shape
-        print(f"Camera resolution: {w}x{h}")
+        # Dark overlay background
+        bg = frame.copy() if frame is not None else None
+        overlay = bg if bg is not None else (cv2.UMat(h, w, cv2.CV_8UC3) if False else
+                  __import__('numpy').zeros((h, w, 3), dtype='uint8'))
 
-        # --- FIX: Dynamic sizing based on resolution ---
-        # PIECE_SIZE = 20% of frame height, capped between 100 and 220
+        # Semi-transparent dark panel
+        panel = overlay.copy()
+        cv2.rectangle(panel, (w//2 - 320, h//2 - 200), (w//2 + 320, h//2 + 240), (20, 20, 20), -1)
+        cv2.addWeighted(panel, 0.85, overlay, 0.15, 0, overlay)
+
+        draw_centered_text(overlay, "PixelStorm", h // 2 - 200, 1.4, (0, 220, 160), 3)
+        draw_centered_text(overlay, "Assemble the Chaos", h // 2 - 160, 0.7, (160, 160, 160), 1)
+
+        draw_input_box(overlay, "Your Name", name_val, name_y, active_field == 0, w)
+        draw_input_box(overlay, "Employee ID", id_val, id_y, active_field == 1, w)
+        btn_coords = draw_button(overlay, "START PUZZLE", btn_y, w)
+
+        draw_centered_text(overlay, "Click a field then type. Press Tab to switch fields.", h - 30, 0.5, (150, 150, 150), 1)
+
+        cv2.imshow("PixelStorm", overlay)
+
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == 255:
+            continue
+
+        # Tab switches field
+        if key == 9:
+            active_field = 1 - active_field
+
+        # Escape quits
+        elif key == 27:
+            return None, None
+
+        # Backspace
+        elif key == 8:
+            if active_field == 0 and name_val:
+                name_val = name_val[:-1]
+            elif active_field == 1 and id_val:
+                id_val = id_val[:-1]
+
+        # Enter = submit if both fields filled
+        elif key == 13:
+            if name_val.strip() and id_val.strip():
+                return name_val.strip(), id_val.strip()
+
+        # Click detection via mouse (handled separately via setMouseCallback)
+        # Printable characters
+        elif 32 <= key <= 126:
+            char = chr(key)
+            if active_field == 0:
+                name_val += char
+            else:
+                id_val += char
+
+    return None, None
+
+# Mouse click state for form
+_mouse_click = None
+def _mouse_callback(event, x, y, flags, param):
+    global _mouse_click
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _mouse_click = (x, y)
+
+# ---------------- FULL FORM WITH MOUSE SUPPORT ----------------
+def run_form_with_mouse(cap, w, h):
+    global _mouse_click
+    _mouse_click = None
+
+    cv2.setMouseCallback("PixelStorm", _mouse_callback)
+
+    name_val = ""
+    id_val = ""
+    active_field = 0
+
+    name_y = h // 2 - 120
+    id_y   = h // 2 + 20
+    btn_y  = h // 2 + 160
+
+    name_box  = ((w - 500) // 2, name_y, (w - 500) // 2 + 500, name_y + 50)
+    id_box    = ((w - 500) // 2, id_y,   (w - 500) // 2 + 500, id_y + 50)
+    btn_box   = ((w - 300) // 2, btn_y,  (w - 300) // 2 + 300, btn_y + 60)
+
+    import numpy as np
+
+    while True:
+        ret, frame = cap.read()
+        overlay = frame.copy() if ret and frame is not None else np.zeros((h, w, 3), dtype='uint8')
+
+        # Dark panel
+        panel = overlay.copy()
+        cv2.rectangle(panel, (w//2 - 320, h//2 - 210), (w//2 + 320, h//2 + 250), (15, 15, 15), -1)
+        cv2.addWeighted(panel, 0.82, overlay, 0.18, 0, overlay)
+
+        draw_centered_text(overlay, "PixelStorm", h // 2 - 200, 1.4, (0, 220, 160), 3)
+        draw_centered_text(overlay, "Assemble the Chaos", h // 2 - 162, 0.7, (160, 160, 160), 1)
+
+        draw_input_box(overlay, "Your Name", name_val, name_y, active_field == 0, w)
+        draw_input_box(overlay, "Employee ID", id_val, id_y, active_field == 1, w)
+        draw_button(overlay, "START PUZZLE", btn_y, w)
+
+        draw_centered_text(overlay, "Click field + type  |  Tab to switch  |  Enter to start", h - 30, 0.5, (140, 140, 140), 1)
+
+        cv2.imshow("PixelStorm", overlay)
+
+        # Handle mouse clicks
+        if _mouse_click:
+            mx, my = _mouse_click
+            _mouse_click = None
+            if name_box[0] < mx < name_box[2] and name_box[1] < my < name_box[3]:
+                active_field = 0
+            elif id_box[0] < mx < id_box[2] and id_box[1] < my < id_box[3]:
+                active_field = 1
+            elif btn_box[0] < mx < btn_box[2] and btn_box[1] < my < btn_box[3]:
+                if name_val.strip() and id_val.strip():
+                    cv2.setMouseCallback("PixelStorm", lambda *a: None)
+                    return name_val.strip(), id_val.strip()
+
+        key = cv2.waitKey(30) & 0xFF
+        if key == 255:
+            continue
+
+        if key == 9:    # Tab
+            active_field = 1 - active_field
+        elif key == 27: # Esc
+            cv2.setMouseCallback("PixelStorm", lambda *a: None)
+            return None, None
+        elif key == 13: # Enter
+            if name_val.strip() and id_val.strip():
+                cv2.setMouseCallback("PixelStorm", lambda *a: None)
+                return name_val.strip(), id_val.strip()
+        elif key == 8:  # Backspace
+            if active_field == 0 and name_val:
+                name_val = name_val[:-1]
+            elif active_field == 1 and id_val:
+                id_val = id_val[:-1]
+        elif 32 <= key <= 126:
+            if active_field == 0:
+                name_val += chr(key)
+            else:
+                id_val += chr(key)
+
+# ---------------- MAIN GAME ----------------
+def run_game(cap, w, h, name, emp_id):
+    try:
+        # Dynamic sizing
         PIECE_SIZE = max(100, min(220, int(h * 0.20)))
         SNAP_DISTANCE = int(PIECE_SIZE * 0.4)
-        # PINCH_THRESHOLD = 6% of frame height (scales with how far camera is)
         PINCH_THRESHOLD = max(25, int(h * 0.06))
 
-        print(f"PIECE_SIZE={PIECE_SIZE}, SNAP_DISTANCE={SNAP_DISTANCE}, PINCH_THRESHOLD={PINCH_THRESHOLD}")
-
-        # --- FIX: Grid must fit within frame with padding ---
-        grid_total = GRID_SIZE * PIECE_SIZE
-        # If grid is too big for the frame, shrink PIECE_SIZE to fit
         max_grid = int(min(w, h) * 0.75)
-        if grid_total > max_grid:
+        if GRID_SIZE * PIECE_SIZE > max_grid:
             PIECE_SIZE = max_grid // GRID_SIZE
             SNAP_DISTANCE = int(PIECE_SIZE * 0.4)
-            grid_total = GRID_SIZE * PIECE_SIZE
-            print(f"Grid too big, shrunk PIECE_SIZE to {PIECE_SIZE}")
 
+        grid_total = GRID_SIZE * PIECE_SIZE
         grid_start_x = (w - grid_total) // 2
         grid_start_y = (h - grid_total) // 2
 
-        # --- Puzzle image ---
+        # Load image
         image_path = get_image_path()
         if not os.path.exists(image_path):
-            cap.release()
-            root.after(0, lambda: messagebox.showerror(
-                "File Error",
-                f"puzzle.jpg not found!\nLooking in: {get_base_path()}\n\nMake sure puzzle.jpg is in the same folder as the .exe"
-            ))
-            root.after(500, root.deiconify)
+            show_error(f"puzzle.jpg not found in:\n{get_base_path()}")
             return
 
         full_image = cv2.imread(image_path)
         if full_image is None:
-            cap.release()
-            root.after(0, lambda: messagebox.showerror("File Error", "puzzle.jpg could not be read. Make sure it is a valid JPG image."))
-            root.after(500, root.deiconify)
+            show_error("puzzle.jpg could not be read.")
             return
 
-        # --- MediaPipe ---
-        from mediapipe.python.solutions import hands as mp_hands_module
-        hands = mp_hands_module.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.6,   # Slightly lower for far/wide cameras
-            min_tracking_confidence=0.6
-        )
-
-        # --- Setup pieces ---
         full_image = cv2.resize(full_image, (GRID_SIZE * PIECE_SIZE, GRID_SIZE * PIECE_SIZE))
         image_pieces = []
         for row in range(GRID_SIZE):
             for col in range(GRID_SIZE):
-                x = col * PIECE_SIZE
-                y = row * PIECE_SIZE
+                x, y = col * PIECE_SIZE, row * PIECE_SIZE
                 image_pieces.append(full_image[y:y+PIECE_SIZE, x:x+PIECE_SIZE])
 
+        # MediaPipe
+        from mediapipe.python.solutions import hands as mp_hands_module
+        hands = mp_hands_module.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+
+        # Pieces
         pieces = []
         placed_count = 0
         game_complete = False
@@ -227,45 +339,38 @@ def run_game():
 
         dragging_piece = None
         was_pinching = False
-        smooth_x, smooth_y = 0, 0
-        smooth_thumb_x, smooth_thumb_y = 0, 0
-        pinch_counter = 0
-        release_counter = 0
+        smooth_x = smooth_y = smooth_thumb_x = smooth_thumb_y = 0
+        pinch_counter = release_counter = 0
         confirmed_pinching = False
 
-        # Current camera index (can be switched with C key)
-        current_camera_index = camera_index
-        available_cameras = [i for i in range(7) if score_camera(i) > 0]
-        print(f"All available cameras: {available_cameras}")
+        positions = [(random.randint(20, w-PIECE_SIZE-20), random.randint(20, h-PIECE_SIZE-20))
+                     for _ in range(GRID_SIZE * GRID_SIZE)]
+        random.shuffle(positions)
 
-        random_positions = []
-        for _ in range(GRID_SIZE * GRID_SIZE):
-            rx = random.randint(20, w - PIECE_SIZE - 20)
-            ry = random.randint(20, h - PIECE_SIZE - 20)
-            random_positions.append((rx, ry))
-        random.shuffle(random_positions)
+        for idx, (row, col) in enumerate([(r, c) for r in range(GRID_SIZE) for c in range(GRID_SIZE)]):
+            pieces.append({
+                "img": image_pieces[idx],
+                "x": positions[idx][0], "y": positions[idx][1],
+                "correct_x": grid_start_x + col * PIECE_SIZE,
+                "correct_y": grid_start_y + row * PIECE_SIZE,
+                "locked": False
+            })
 
-        index = 0
-        for row in range(GRID_SIZE):
-            for col in range(GRID_SIZE):
-                correct_x = grid_start_x + col * PIECE_SIZE
-                correct_y = grid_start_y + row * PIECE_SIZE
-                start_x, start_y = random_positions[index]
-                pieces.append({
-                    "img": image_pieces[index],
-                    "x": start_x, "y": start_y,
-                    "correct_x": correct_x, "correct_y": correct_y,
-                    "locked": False
-                })
-                index += 1
-
-        cv2.namedWindow("PixelStorm", cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty("PixelStorm", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-        show_hint = True
+        # Detect available cameras — skip current one (already open)
+        available_cameras = [current_camera_index]
+        for i in range(7):
+            if i == current_camera_index:
+                continue
+            test = open_camera(i)
+            if test is not None:
+                available_cameras.append(i)
+                test.release()
+        available_cameras.sort()
+        print(f"Available cameras: {available_cameras}")
         hint_start = time.time()
+        camera_switch_msg = ""
+        camera_switch_time = 0
 
-        # --- Game loop ---
         while True:
             try:
                 ret, frame = cap.read()
@@ -280,36 +385,27 @@ def run_game():
                 except Exception:
                     results = None
 
-                cursor_x, cursor_y = None, None
+                cursor_x = cursor_y = None
                 raw_pinching = False
 
                 if results and results.multi_hand_landmarks:
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        index_tip = hand_landmarks.landmark[8]
-                        thumb_tip = hand_landmarks.landmark[4]
-
-                        raw_x = int(index_tip.x * w)
-                        raw_y = int(index_tip.y * h)
-                        raw_thumb_x = int(thumb_tip.x * w)
-                        raw_thumb_y = int(thumb_tip.y * h)
-
-                        smooth_x = int(SMOOTHING * smooth_x + (1 - SMOOTHING) * raw_x)
-                        smooth_y = int(SMOOTHING * smooth_y + (1 - SMOOTHING) * raw_y)
-                        smooth_thumb_x = int(SMOOTHING * smooth_thumb_x + (1 - SMOOTHING) * raw_thumb_x)
-                        smooth_thumb_y = int(SMOOTHING * smooth_thumb_y + (1 - SMOOTHING) * raw_thumb_y)
-
+                    for lm in results.multi_hand_landmarks:
+                        it = lm.landmark[8]
+                        tt = lm.landmark[4]
+                        rx, ry = int(it.x * w), int(it.y * h)
+                        rtx, rty = int(tt.x * w), int(tt.y * h)
+                        smooth_x = int(SMOOTHING * smooth_x + (1-SMOOTHING) * rx)
+                        smooth_y = int(SMOOTHING * smooth_y + (1-SMOOTHING) * ry)
+                        smooth_thumb_x = int(SMOOTHING * smooth_thumb_x + (1-SMOOTHING) * rtx)
+                        smooth_thumb_y = int(SMOOTHING * smooth_thumb_y + (1-SMOOTHING) * rty)
                         cursor_x, cursor_y = smooth_x, smooth_y
-
                         if math.hypot(smooth_thumb_x - cursor_x, smooth_thumb_y - cursor_y) < PINCH_THRESHOLD:
                             raw_pinching = True
 
-                # Debounce pinch
                 if raw_pinching:
-                    pinch_counter += 1
-                    release_counter = 0
+                    pinch_counter += 1; release_counter = 0
                 else:
-                    release_counter += 1
-                    pinch_counter = 0
+                    release_counter += 1; pinch_counter = 0
 
                 if pinch_counter >= PINCH_DEBOUNCE_FRAMES:
                     confirmed_pinching = True
@@ -326,10 +422,8 @@ def run_game():
                                     break
 
                     if dragging_piece and confirmed_pinching:
-                        new_x = max(0, min(w - PIECE_SIZE, cursor_x - PIECE_SIZE // 2))
-                        new_y = max(0, min(h - PIECE_SIZE, cursor_y - PIECE_SIZE // 2))
-                        dragging_piece["x"] = new_x
-                        dragging_piece["y"] = new_y
+                        dragging_piece["x"] = max(0, min(w-PIECE_SIZE, cursor_x - PIECE_SIZE//2))
+                        dragging_piece["y"] = max(0, min(h-PIECE_SIZE, cursor_y - PIECE_SIZE//2))
 
                     if dragging_piece and not confirmed_pinching and was_pinching:
                         dx = dragging_piece["x"] - dragging_piece["correct_x"]
@@ -345,157 +439,150 @@ def run_game():
 
                 # Draw grid
                 for i in range(GRID_SIZE + 1):
-                    cv2.line(frame,
-                             (grid_start_x + i * PIECE_SIZE, grid_start_y),
-                             (grid_start_x + i * PIECE_SIZE, grid_start_y + grid_total),
-                             (0, 0, 0), 2)
-                    cv2.line(frame,
-                             (grid_start_x, grid_start_y + i * PIECE_SIZE),
-                             (grid_start_x + grid_total, grid_start_y + i * PIECE_SIZE),
-                             (0, 0, 0), 2)
+                    cv2.line(frame, (grid_start_x + i*PIECE_SIZE, grid_start_y),
+                             (grid_start_x + i*PIECE_SIZE, grid_start_y + grid_total), (0,0,0), 2)
+                    cv2.line(frame, (grid_start_x, grid_start_y + i*PIECE_SIZE),
+                             (grid_start_x + grid_total, grid_start_y + i*PIECE_SIZE), (0,0,0), 2)
 
                 # Draw pieces
                 for piece in pieces:
-                    x = max(0, min(w - PIECE_SIZE, piece["x"]))
-                    y = max(0, min(h - PIECE_SIZE, piece["y"]))
+                    x = max(0, min(w-PIECE_SIZE, piece["x"]))
+                    y = max(0, min(h-PIECE_SIZE, piece["y"]))
                     try:
                         frame[y:y+PIECE_SIZE, x:x+PIECE_SIZE] = piece["img"]
                     except Exception:
                         pass
 
-                # FIX: Draw visual cursor so player can see exactly where finger is
+                # Cursor dot
                 if cursor_x and cursor_y:
                     color = (0, 255, 0) if confirmed_pinching else (255, 255, 255)
                     cv2.circle(frame, (cursor_x, cursor_y), 12, color, -1)
-                    cv2.circle(frame, (cursor_x, cursor_y), 14, (0, 0, 0), 2)
+                    cv2.circle(frame, (cursor_x, cursor_y), 14, (0,0,0), 2)
 
                 # Timer
                 if not game_complete:
                     elapsed = int(time.time() - start_time)
                     cv2.putText(frame, f"Time: {elapsed}s", (40, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 3)
 
-                # Hint: press C to switch camera (show for first 5 seconds)
-                if show_hint and time.time() - hint_start < 5:
-                    cv2.putText(frame, "Press C to switch camera",
-                                (40, h - 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+                # Camera hint
+                if time.time() - hint_start < 5:
+                    cv2.putText(frame, "Press C to switch camera | ESC to quit",
+                                (40, h-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
 
-                # Win condition
+                # Win
                 if placed_count == GRID_SIZE * GRID_SIZE and not game_complete:
                     game_complete = True
                     completion_time = time.time() - start_time
                     win_time_start = time.time()
-                    save_results(employee_name, employee_id, completion_time)
+                    save_results(name, emp_id, completion_time)
 
                 if game_complete and win_time_start is not None:
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     win_text = "PUZZLE COMPLETED!"
-                    win_size = cv2.getTextSize(win_text, font, 2, 5)[0]
-                    win_x = (w - win_size[0]) // 2
-                    win_y = h // 2 - 40
-                    cv2.putText(frame, win_text, (win_x, win_y), font, 2, (0, 255, 0), 5)
-                    time_text = f"Completion Time: {completion_time:.2f} seconds"
-                    time_size = cv2.getTextSize(time_text, font, 1.2, 3)[0]
-                    time_x = (w - time_size[0]) // 2
-                    cv2.putText(frame, time_text, (time_x, win_y + 70), font, 1.2, (0, 0, 0), 4)
+                    ws = cv2.getTextSize(win_text, font, 2, 5)[0]
+                    cv2.putText(frame, win_text, ((w-ws[0])//2, h//2-40), font, 2, (0,255,0), 5)
+                    tt = f"Completion Time: {completion_time:.2f} seconds"
+                    ts = cv2.getTextSize(tt, font, 1.2, 3)[0]
+                    cv2.putText(frame, tt, ((w-ts[0])//2, h//2+30), font, 1.2, (0,0,0), 4)
                     if time.time() - win_time_start > WIN_DELAY:
                         break
 
+                # Show camera switch message for 3 seconds
+                if camera_switch_msg and time.time() - camera_switch_time < 3:
+                    cv2.putText(frame, camera_switch_msg,
+                                (40, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2)
+
                 cv2.imshow("PixelStorm", frame)
+                key = cv2.waitKey(16) & 0xFF
 
-                key = cv2.waitKey(1) & 0xFF
-
-                # ESC to quit
                 if key == 27:
                     break
-
-                # C key to cycle through cameras
-                if key == ord('c') or key == ord('C'):
+                if key in (ord('c'), ord('C')):
                     if len(available_cameras) > 1:
-                        current_idx_in_list = available_cameras.index(current_camera_index) if current_camera_index in available_cameras else 0
-                        next_idx = (current_idx_in_list + 1) % len(available_cameras)
-                        new_camera_index = available_cameras[next_idx]
-                        new_cap = open_camera(new_camera_index)
+                        idx_in_list = available_cameras.index(current_camera_index) if current_camera_index in available_cameras else 0
+                        next_cam = available_cameras[(idx_in_list + 1) % len(available_cameras)]
+                        new_cap = open_camera(next_cam)
                         if new_cap:
                             cap.release()
                             cap = new_cap
-                            current_camera_index = new_camera_index
-                            print(f"Switched to camera {new_camera_index}")
+                            current_camera_index = next_cam
+                            camera_switch_msg = f"Switched to camera {next_cam}"
+                            camera_switch_time = time.time()
+                            print(camera_switch_msg)
+                        else:
+                            camera_switch_msg = f"Camera {next_cam} failed to open"
+                            camera_switch_time = time.time()
+                    else:
+                        camera_switch_msg = f"Only 1 camera found (index {current_camera_index})"
+                        camera_switch_time = time.time()
 
             except Exception as e:
                 print(f"Frame error: {e}")
                 continue
 
     except Exception as e:
-        error_msg = traceback.format_exc()
-        print(f"GAME ERROR:\n{error_msg}")
-        root.after(0, lambda msg=error_msg: messagebox.showerror(
-            "Game Error",
-            f"Something went wrong:\n\n{msg[:800]}"
-        ))
+        print(f"Game error:\n{traceback.format_exc()}")
 
     finally:
         try:
-            cap.release()
+            hands.close()
         except:
             pass
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
-        root.after(500, root.deiconify)
 
+def show_error(msg):
+    import numpy as np
+    frame = np.zeros((400, 700, 3), dtype='uint8')
+    y = 80
+    for line in msg.split('\n'):
+        cv2.putText(frame, line, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
+        y += 40
+    cv2.putText(frame, "Press any key to exit", (40, y+40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+    cv2.imshow("PixelStorm", frame)
+    cv2.waitKey(0)
 
-def start_game():
-    root.withdraw()
-    root.after(300, _launch_game_thread)
+# ---------------- ENTRY POINT ----------------
+def main():
+    # Open camera first
+    camera_index = get_best_camera()
+    cap = open_camera(camera_index)
+    if cap is None:
+        cap = open_camera(0)
+    if cap is None:
+        # Show error in a plain window
+        import numpy as np
+        cv2.namedWindow("PixelStorm", cv2.WINDOW_NORMAL)
+        show_error("ERROR: No camera found.\nPlease connect a camera and restart.")
+        cv2.destroyAllWindows()
+        return
 
-def _launch_game_thread():
-    t = threading.Thread(target=run_game, daemon=True)
-    t.start()
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        cv2.namedWindow("PixelStorm", cv2.WINDOW_NORMAL)
+        show_error("ERROR: Camera found but cannot read frames.")
+        cv2.destroyAllWindows()
+        return
 
+    h, w, _ = frame.shape
 
-# ---------------- EMPLOYEE FORM ----------------
-def open_employee_form():
-    form = tk.Toplevel(root)
-    form.title("Enter Details")
-    form.geometry("400x250")
-    form.configure(bg="#111111")
+    # Open fullscreen window
+    cv2.namedWindow("PixelStorm", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("PixelStorm", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    tk.Label(form, text="Enter Your Name",
-             font=("Helvetica", 14), fg="white", bg="#111111").pack(pady=10)
-    name_entry = tk.Entry(form, font=("Helvetica", 12))
-    name_entry.pack(pady=5)
+    # Show employee form inside OpenCV window
+    name, emp_id = run_form_with_mouse(cap, w, h)
 
-    tk.Label(form, text="Enter Employee ID",
-             font=("Helvetica", 14), fg="white", bg="#111111").pack(pady=10)
-    id_entry = tk.Entry(form, font=("Helvetica", 12))
-    id_entry.pack(pady=5)
+    if not name or not emp_id:
+        cap.release()
+        cv2.destroyAllWindows()
+        return
 
-    def submit():
-        global employee_name, employee_id
-        employee_name = name_entry.get().strip()
-        employee_id = id_entry.get().strip()
-        if employee_name and employee_id:
-            form.destroy()
-            start_game()
+    # Run game
+    run_game(cap, w, h, name, emp_id)
 
-    tk.Button(form, text="Start Puzzle", font=("Helvetica", 12),
-              bg="#00aa88", fg="white", command=submit).pack(pady=20)
+    cap.release()
+    cv2.destroyAllWindows()
 
-
-# ---------------- LANDING SCREEN ----------------
-root = tk.Tk()
-root.title("PixelStorm: Assemble the Chaos")
-root.geometry("600x400")
-root.configure(bg="#111111")
-
-tk.Label(root, text="PixelStorm: Assemble the Chaos",
-         font=("Helvetica", 22, "bold"), fg="white", bg="#111111").pack(pady=80)
-
-tk.Button(root, text="Start Game", font=("Helvetica", 16),
-          bg="#00aa88", fg="white", width=15, height=2,
-          command=open_employee_form).pack()
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
